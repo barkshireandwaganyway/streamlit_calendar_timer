@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Lovely Grooming Appointment Timer</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="app">
+    <div class="header">
+      <div>
+        <h1>Lovely Grooming Appointment Timer</h1>
+        <div class="small">Manual appointment board with Google Sheets tracking. Calendar sync can be added after manual mode is stable.</div>
+      </div>
+      <button class="secondary" id="healthBtn">Check Connection</button>
+    </div>
+
+    <div id="message"></div>
+
+    <div class="tabs">
+      <button class="tab active" data-tab="boardPanel">Appointment Board</button>
+      <button class="tab" data-tab="settingsPanel">Admin Settings</button>
+      <button class="tab" data-tab="recordsPanel">Daily Records</button>
+    </div>
+
+    <section id="boardPanel" class="panel active">
+      <div class="toolbar">
+        <div>
+          <label for="dateInput">Date</label>
+          <input type="date" id="dateInput">
+        </div>
+        <button class="secondary" id="refreshBtn">Refresh</button>
+        <button class="primary" id="toggleManualBtn">Add Appointment</button>
+      </div>
+
+      <div id="manualBox" class="manual-box hidden">
+        <h2>Manual Appointment Entry</h2>
+        <div class="small">Only enter what you know. Blank fields are allowed.</div>
+        <div class="manual-grid">
+          <div><label>Customer name</label><input id="customerName"></div>
+          <div><label>Dog name</label><input id="dogName"></div>
+          <div><label>Dog size</label><select id="dogSize"></select></div>
+          <div><label>Start time</label><input type="time" id="startTime"></div>
+          <div><label>End time</label><input type="time" id="endTime"></div>
+          <div><label>Primary staff</label><select id="primaryStaff"></select></div>
+          <div class="full"><label>Services</label><select id="services" multiple></select></div>
+          <div class="full"><label>Items / add-ons</label><select id="addons" multiple></select></div>
+          <div class="full"><label>Specific shampoo or conditioner</label><input id="shampoo"></div>
+          <div class="full"><label>Specific notes</label><textarea id="notes"></textarea></div>
+          <div class="full"><button class="primary" id="addApptBtn">Save Appointment</button></div>
+        </div>
+      </div>
+
+      <div id="board" class="board"></div>
+    </section>
+
+    <section id="settingsPanel" class="panel">
+      <div class="settings-box">
+        <h2>Admin Settings</h2>
+        <div class="small">These settings save to the APP_SETTINGS tab in Google Sheets.</div>
+        <div class="settings-grid" id="settingsGrid"></div>
+        <div style="margin-top:16px">
+          <button class="primary" id="saveSettingsBtn">Save Settings</button>
+          <button class="secondary" id="resetDefaultsBtn">Restore Default Settings</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="recordsPanel" class="panel">
+      <div class="settings-box">
+        <h2>Daily Records</h2>
+        <div class="small">Use this for quick admin review. Full records are stored in the daily sheet tab.</div>
+        <div style="margin:12px 0"><button class="secondary" id="loadRecordsBtn">Load Records</button></div>
+        <div style="overflow:auto"><table class="record-table" id="recordsTable"></table></div>
+      </div>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
