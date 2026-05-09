@@ -1,6 +1,6 @@
-import json
 import re
 import time
+import uuid
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -11,8 +11,9 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
 # ============================================================
-# Lovely Grooming Calendar Appointment Timer
-# Google Calendar -> Streamlit -> Google Sheets Daily Log
+# Lovely Grooming Appointment Timer
+# Calendar Sync ON/OFF + Manual Appointment Entry
+# Google Calendar / Manual Entry -> Streamlit -> Google Sheets Daily Log
 # ============================================================
 
 st.set_page_config(
@@ -22,18 +23,52 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-LOCAL_TZ = ZoneInfo(st.secrets.get("app", {}).get("timezone", "America/Chicago"))
+# -----------------------------
+# Secrets compatibility helpers
+# Supports both older/nested secrets and simple top-level secrets.
+# -----------------------------
+def secret_get(*path, default=None):
+    current = st.secrets
+    try:
+        for key in path:
+            current = current[key]
+        return current
+    except Exception:
+        return default
+
+LOCAL_TZ_NAME = (
+    secret_get("app", "timezone", default=None)
+    or secret_get("APP_TIMEZONE", default=None)
+    or "America/Chicago"
+)
+LOCAL_TZ = ZoneInfo(LOCAL_TZ_NAME)
+
 SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
-DEFAULT_BATHERS = ["Emily"]
 DEFAULT_GROOMERS = ["Kim", "Veronica", "Alex"]
+DEFAULT_BATHERS = ["Bather1", "Bather 2", "Bather 3"]
+DEFAULT_STAFF = DEFAULT_GROOMERS + DEFAULT_BATHERS
+
+DOG_SIZES = ["", "Small", "Medium", "Large", "XL", "XXL", "XXXL"]
+SERVICES = [
+    "Bath",
+    "De-shed",
+    "De-shed + Classic cleanup",
+    "Full haircut",
+]
+ADD_ON_ITEMS = [
+    "Anal gland expression",
+    "Ear plucking cleaning",
+    "Nail trim",
+]
 
 HEADERS = [
     "appointment_id",
+    "entry_source",
     "calendar_id",
     "google_event_id",
     "date",
@@ -42,7 +77,13 @@ HEADERS = [
     "employee_from_calendar",
     "assigned_employee_buttons",
     "appointment_title",
+    "customer_name",
+    "pet_name",
+    "dog_size",
     "service_info",
+    "selected_services",
+    "add_on_items",
+    "specific_shampoo_conditioner",
     "description",
     "location",
     "status",
@@ -86,16 +127,18 @@ st.markdown(
             color: #555;
             margin-bottom: 8px;
         }
-        .status-pill {
+        .manual-pill, .calendar-pill, .status-pill {
             display: inline-block;
             padding: 3px 9px;
             border-radius: 999px;
-            background: #800d5c;
             color: white;
             font-size: 0.78rem;
             font-weight: 700;
-            margin-top: 4px;
+            margin: 4px 4px 4px 0;
         }
+        .status-pill { background: #800d5c; }
+        .manual-pill { background: #555; }
+        .calendar-pill { background: #1f6feb; }
         div.stButton > button {
             border-radius: 12px;
             font-weight: 700;
@@ -111,7 +154,12 @@ st.markdown(
 # -----------------------------
 @st.cache_resource(show_spinner=False)
 def get_credentials():
-    raw = dict(st.secrets["gcp_service_account"])
+    raw = secret_get("gcp_service_account", default=None)
+    if raw is None:
+        raw = secret_get("google_service_account", default=None)
+    if raw is None:
+        raise RuntimeError("Missing service account secrets. Add [google_service_account] to Streamlit secrets.")
+    raw = dict(raw)
     if "private_key" in raw:
         raw["private_key"] = raw["private_key"].replace("\\n", "\n")
     return Credentials.from_service_account_info(raw, scopes=SCOPES)
@@ -130,22 +178,46 @@ def get_gspread_client():
 @st.cache_resource(show_spinner=False)
 def get_workbook():
     gc = get_gspread_client()
-    sheet_id = st.secrets["sheets"]["spreadsheet_id"]
+    sheet_id = secret_get("sheets", "spreadsheet_id", default=None) or secret_get("SPREADSHEET_ID", default=None)
+    if not sheet_id:
+        raise RuntimeError("Missing SPREADSHEET_ID in Streamlit secrets.")
     return gc.open_by_key(sheet_id)
 
 # -----------------------------
 # Config helpers
 # -----------------------------
 def get_employee_config():
-    people = st.secrets.get("employees", {})
-    bathers = list(people.get("bathers", DEFAULT_BATHERS))
-    groomers = list(people.get("groomers", DEFAULT_GROOMERS))
+    employees = secret_get("employees", default={}) or {}
+    bathers = list(employees.get("bathers", DEFAULT_BATHERS))
+    groomers = list(employees.get("groomers", DEFAULT_GROOMERS))
+
+    # Force your requested defaults if secrets are not configured.
+    if not bathers:
+        bathers = DEFAULT_BATHERS
+    if not groomers:
+        groomers = DEFAULT_GROOMERS
+
     return bathers, groomers
 
 
+def get_staff_list():
+    bathers, groomers = get_employee_config()
+    return groomers + bathers
+
+
 def get_calendar_config():
-    calendars = st.secrets.get("calendars", {})
-    ids = calendars.get("calendar_ids", ["primary"])
+    # New simple format:
+    # [employee_calendars]
+    # Kim = "calendar-id"
+    simple_map = secret_get("employee_calendars", default=None)
+    if simple_map:
+        employee_calendar_map = {v: k for k, v in dict(simple_map).items() if v}
+        calendar_ids = [v for v in dict(simple_map).values() if v]
+        return calendar_ids, employee_calendar_map
+
+    # Older nested format.
+    calendars = secret_get("calendars", default={}) or {}
+    ids = calendars.get("calendar_ids", [])
     if isinstance(ids, str):
         ids = [x.strip() for x in ids.split(",") if x.strip()]
     employee_calendar_map = dict(calendars.get("employee_calendar_map", {}))
@@ -160,7 +232,7 @@ def parse_iso(value):
     if not value:
         return None
     try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=LOCAL_TZ)
         return dt.astimezone(LOCAL_TZ)
@@ -174,6 +246,18 @@ def seconds_between(start_iso, end_iso):
     if not start or not end:
         return ""
     return max(0, int((end - start).total_seconds()))
+
+
+def fmt_duration(seconds):
+    try:
+        seconds = int(float(seconds))
+    except Exception:
+        return ""
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
 
 
 def fmt_time(dt_iso_or_obj):
@@ -201,13 +285,23 @@ def clean_text(value):
 def event_start_end(event):
     start_raw = event.get("start", {}).get("dateTime") or event.get("start", {}).get("date")
     end_raw = event.get("end", {}).get("dateTime") or event.get("end", {}).get("date")
-    start = parse_iso(start_raw) if "T" in start_raw else datetime.fromisoformat(start_raw).replace(tzinfo=LOCAL_TZ)
-    end = parse_iso(end_raw) if "T" in end_raw else datetime.fromisoformat(end_raw).replace(tzinfo=LOCAL_TZ)
+    if not start_raw:
+        start = datetime.now(LOCAL_TZ)
+    elif "T" in start_raw:
+        start = parse_iso(start_raw)
+    else:
+        start = datetime.fromisoformat(start_raw).replace(tzinfo=LOCAL_TZ)
+
+    if not end_raw:
+        end = start + timedelta(hours=1)
+    elif "T" in end_raw:
+        end = parse_iso(end_raw)
+    else:
+        end = datetime.fromisoformat(end_raw).replace(tzinfo=LOCAL_TZ)
     return start, end
 
 
 def infer_employee(event, calendar_id, employee_calendar_map, all_employees):
-    # 1. Calendar ID mapping is the most reliable when each employee has their own calendar.
     if calendar_id in employee_calendar_map:
         return employee_calendar_map[calendar_id]
 
@@ -225,11 +319,22 @@ def infer_employee(event, calendar_id, employee_calendar_map, all_employees):
     return "Unassigned"
 
 
+def extract_service_info(event):
+    text = clean_text(event.get("description", ""))
+    summary = event.get("summary", "")
+    service_matches = re.findall(r"(?:service|appointment type|booking)[:\-]\s*([^\n\|]+)", text, flags=re.I)
+    if service_matches:
+        return service_matches[0].strip()
+    return summary
+
+
 def fetch_calendar_events(selected_date):
-    calendar_service = get_calendar_service()
     calendar_ids, employee_calendar_map = get_calendar_config()
-    bathers, groomers = get_employee_config()
-    all_employees = bathers + groomers
+    if not calendar_ids:
+        return []
+
+    calendar_service = get_calendar_service()
+    all_employees = get_staff_list()
 
     day_start = datetime.combine(selected_date, datetime.min.time(), tzinfo=LOCAL_TZ)
     day_end = day_start + timedelta(days=1)
@@ -251,9 +356,10 @@ def fetch_calendar_events(selected_date):
                     continue
                 start, end = event_start_end(event)
                 employee = infer_employee(event, calendar_id, employee_calendar_map, all_employees)
-                appointment_id = f"{calendar_id}::{event.get('id')}::{selected_date.isoformat()}"
+                appointment_id = f"calendar::{calendar_id}::{event.get('id')}::{selected_date.isoformat()}"
                 events.append({
                     "appointment_id": appointment_id,
+                    "entry_source": "Calendar",
                     "calendar_id": calendar_id,
                     "google_event_id": event.get("id", ""),
                     "date": selected_date.isoformat(),
@@ -262,7 +368,13 @@ def fetch_calendar_events(selected_date):
                     "employee_from_calendar": employee,
                     "assigned_employee_buttons": employee if employee != "Unassigned" else "",
                     "appointment_title": event.get("summary", "Untitled appointment"),
+                    "customer_name": "",
+                    "pet_name": "",
+                    "dog_size": "",
                     "service_info": extract_service_info(event),
+                    "selected_services": "",
+                    "add_on_items": "",
+                    "specific_shampoo_conditioner": "",
                     "description": clean_text(event.get("description", "")),
                     "location": event.get("location", ""),
                     "status": STATUS_NEW,
@@ -280,16 +392,6 @@ def fetch_calendar_events(selected_date):
     events.sort(key=lambda x: x["calendar_start"])
     return events
 
-
-def extract_service_info(event):
-    text = clean_text(event.get("description", ""))
-    summary = event.get("summary", "")
-    # Basic fallback: Square/Calendar entries often put service in title or description.
-    service_matches = re.findall(r"(?:service|appointment type|booking)[:\-]\s*([^\n\|]+)", text, flags=re.I)
-    if service_matches:
-        return service_matches[0].strip()
-    return summary
-
 # -----------------------------
 # Sheets sync
 # -----------------------------
@@ -303,7 +405,7 @@ def get_or_create_day_sheet(selected_date):
     try:
         ws = wb.worksheet(title)
     except gspread.WorksheetNotFound:
-        ws = wb.add_worksheet(title=title, rows=1000, cols=len(HEADERS) + 3)
+        ws = wb.add_worksheet(title=title, rows=1000, cols=len(HEADERS) + 5)
         ws.append_row(HEADERS)
         ws.freeze(rows=1)
     existing_headers = ws.row_values(1)
@@ -335,22 +437,31 @@ def save_day_log(selected_date, df):
 
 def sync_events_to_sheet(selected_date):
     events = fetch_calendar_events(selected_date)
-    ws, df = load_day_log(selected_date)
+    _, df = load_day_log(selected_date)
 
     if df.empty:
         df = pd.DataFrame(columns=HEADERS)
 
     existing_ids = set(df["appointment_id"].astype(str).tolist()) if not df.empty else set()
     new_rows = []
+
     for event in events:
         if event["appointment_id"] not in existing_ids:
             new_rows.append(event)
         else:
             idx = df.index[df["appointment_id"] == event["appointment_id"]][0]
-            # Keep clock/status/notes fields, but refresh live calendar fields.
             calendar_fields = [
-                "calendar_id", "google_event_id", "date", "calendar_start", "calendar_end",
-                "employee_from_calendar", "appointment_title", "service_info", "description", "location"
+                "entry_source",
+                "calendar_id",
+                "google_event_id",
+                "date",
+                "calendar_start",
+                "calendar_end",
+                "employee_from_calendar",
+                "appointment_title",
+                "service_info",
+                "description",
+                "location",
             ]
             for field in calendar_fields:
                 df.at[idx, field] = event[field]
@@ -375,12 +486,76 @@ def update_row(selected_date, appointment_id, updates):
         return
     idx = df.index[mask][0]
     for key, value in updates.items():
-        df.at[idx, key] = value
+        if key in df.columns:
+            df.at[idx, key] = value
     df.at[idx, "last_updated"] = now_iso()
     save_day_log(selected_date, df)
 
+
+def add_manual_appointment(selected_date, form_data):
+    _, df = load_day_log(selected_date)
+
+    start_dt = datetime.combine(selected_date, form_data["start_time"], tzinfo=LOCAL_TZ)
+    end_dt = datetime.combine(selected_date, form_data["end_time"], tzinfo=LOCAL_TZ)
+    if end_dt <= start_dt:
+        end_dt = start_dt + timedelta(hours=1)
+
+    customer = form_data.get("customer_name", "").strip()
+    pet = form_data.get("pet_name", "").strip()
+    title_parts = [x for x in [pet, customer] if x]
+    appointment_title = " - ".join(title_parts) if title_parts else "Manual Appointment"
+
+    selected_services = ", ".join(form_data.get("selected_services", []))
+    add_ons = ", ".join(form_data.get("add_on_items", []))
+    shampoo = form_data.get("specific_shampoo_conditioner", "").strip()
+
+    service_bits = []
+    if selected_services:
+        service_bits.append(selected_services)
+    if add_ons:
+        service_bits.append(f"Add-ons: {add_ons}")
+    if shampoo:
+        service_bits.append(f"Specific shampoo/conditioner: {shampoo}")
+    service_info = " | ".join(service_bits)
+
+    assigned_staff = ", ".join(form_data.get("assigned_staff", []))
+
+    row = {
+        "appointment_id": f"manual::{selected_date.isoformat()}::{uuid.uuid4().hex[:12]}",
+        "entry_source": "Manual",
+        "calendar_id": "",
+        "google_event_id": "",
+        "date": selected_date.isoformat(),
+        "calendar_start": start_dt.isoformat(),
+        "calendar_end": end_dt.isoformat(),
+        "employee_from_calendar": "Manual",
+        "assigned_employee_buttons": assigned_staff,
+        "appointment_title": appointment_title,
+        "customer_name": customer,
+        "pet_name": pet,
+        "dog_size": form_data.get("dog_size", ""),
+        "service_info": service_info,
+        "selected_services": selected_services,
+        "add_on_items": add_ons,
+        "specific_shampoo_conditioner": shampoo,
+        "description": "Manual appointment entry",
+        "location": "",
+        "status": STATUS_NEW,
+        "service_start_time": "",
+        "ready_for_pickup_time": "",
+        "service_seconds": "",
+        "picked_up_time": "",
+        "post_service_seconds": "",
+        "notes": form_data.get("notes", "").strip(),
+        "last_updated": now_iso(),
+    }
+
+    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    df = df[HEADERS].sort_values(["calendar_start", "appointment_title"], kind="stable")
+    save_day_log(selected_date, df)
+
 # -----------------------------
-# Streamlit state/action handlers
+# Action handlers
 # -----------------------------
 def start_service(selected_date, row):
     if row.get("status") in [STATUS_STARTED, STATUS_READY, STATUS_PICKED_UP]:
@@ -399,7 +574,6 @@ def ready_for_pickup(selected_date, row):
         "service_seconds": seconds_between(row.get("service_start_time"), ready_time),
     }
     if not row.get("service_start_time"):
-        # If someone skipped START, still record READY and leave service duration blank.
         updates["service_seconds"] = ""
     update_row(selected_date, row["appointment_id"], updates)
     st.session_state["notes_prompt_appt"] = row["appointment_id"]
@@ -427,7 +601,51 @@ def toggle_employee(selected_date, row, employee):
     update_row(selected_date, row["appointment_id"], {"assigned_employee_buttons": ", ".join(current)})
 
 # -----------------------------
-# Modal notes prompt
+# Manual appointment form
+# -----------------------------
+def render_manual_entry_form(selected_date):
+    with st.expander("Add Appointment", expanded=False):
+        with st.form("manual_appointment_form", clear_on_submit=True):
+            st.subheader("Manual Appointment Entry")
+            st.caption("Nothing here is required. Add only what you know and the appointment will still be created.")
+
+            col1, col2, col3 = st.columns(3)
+            customer_name = col1.text_input("Customer name")
+            pet_name = col2.text_input("Dog name")
+            dog_size = col3.selectbox("Dog size", DOG_SIZES, index=0)
+
+            col4, col5 = st.columns(2)
+            default_start = datetime.now(LOCAL_TZ).replace(second=0, microsecond=0).time()
+            default_end_dt = (datetime.combine(date.today(), default_start) + timedelta(hours=1)).time()
+            start_time = col4.time_input("Appointment start time", value=default_start)
+            end_time = col5.time_input("Appointment end time", value=default_end_dt)
+
+            assigned_staff = st.multiselect("Staff buttons to pre-select", get_staff_list())
+            selected_services = st.multiselect("Services", SERVICES)
+            add_on_items = st.multiselect("Items / add-ons", ADD_ON_ITEMS)
+            specific_shampoo_conditioner = st.text_input("Specific shampoo or conditioner")
+            notes = st.text_area("Specific notes", height=90)
+
+            submitted = st.form_submit_button("Add Appointment", use_container_width=True)
+            if submitted:
+                add_manual_appointment(selected_date, {
+                    "customer_name": customer_name,
+                    "pet_name": pet_name,
+                    "dog_size": dog_size,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "assigned_staff": assigned_staff,
+                    "selected_services": selected_services,
+                    "add_on_items": add_on_items,
+                    "specific_shampoo_conditioner": specific_shampoo_conditioner,
+                    "notes": notes,
+                })
+                st.success("Appointment added.")
+                time.sleep(0.5)
+                st.rerun()
+
+# -----------------------------
+# Notes prompt
 # -----------------------------
 def show_notes_prompt(selected_date, row):
     appt_id = row["appointment_id"]
@@ -461,7 +679,9 @@ def show_notes_prompt(selected_date, row):
 # -----------------------------
 def render_employee_buttons(selected_date, row, employees):
     selected = [x.strip() for x in str(row.get("assigned_employee_buttons", "")).split(",") if x.strip()]
-    cols = st.columns(max(1, min(4, len(employees))))
+    if not employees:
+        return
+    cols = st.columns(max(1, min(3, len(employees))))
     for i, employee in enumerate(employees):
         label = f"✓ {employee}" if employee in selected else employee
         if cols[i % len(cols)].button(label, key=f"emp_{row['appointment_id']}_{employee}"):
@@ -471,20 +691,32 @@ def render_employee_buttons(selected_date, row, employees):
 
 def render_appointment_card(selected_date, row, employees):
     appt_id = row["appointment_id"]
-    title = row.get("appointment_title", "Untitled appointment")
+    title = row.get("appointment_title", "Untitled appointment") or "Untitled appointment"
     start = fmt_time(row.get("calendar_start"))
     end = fmt_time(row.get("calendar_end"))
     service = row.get("service_info", "")
     status = row.get("status", STATUS_NEW) or STATUS_NEW
+    source = row.get("entry_source", "") or "Calendar"
+    dog_size = row.get("dog_size", "")
 
     st.markdown("<div class='appt-card'>", unsafe_allow_html=True)
     st.markdown(f"<div class='appt-title'>{title}</div>", unsafe_allow_html=True)
     st.markdown(f"<div class='appt-meta'>{start} - {end}</div>", unsafe_allow_html=True)
-    if service and service != title:
-        st.caption(service)
-    st.markdown(f"<span class='status-pill'>{status.replace('_', ' ')}</span>", unsafe_allow_html=True)
 
-    st.write("")
+    pill_class = "manual-pill" if source == "Manual" else "calendar-pill"
+    st.markdown(
+        f"<span class='{pill_class}'>{source}</span><span class='status-pill'>{status.replace('_', ' ')}</span>",
+        unsafe_allow_html=True,
+    )
+
+    details = []
+    if dog_size:
+        details.append(f"Size: {dog_size}")
+    if service and service != title:
+        details.append(service)
+    if details:
+        st.caption(" | ".join(details))
+
     render_employee_buttons(selected_date, row, employees)
 
     action_cols = st.columns(4)
@@ -516,22 +748,23 @@ def render_appointment_card(selected_date, row, employees):
             save_notes(selected_date, appt_id, notes)
             st.session_state[f"show_notes_box_{appt_id}"] = False
             st.success("Notes saved.")
-            time.sleep(0.5)
+            time.sleep(0.4)
             st.rerun()
+
+    if status == STATUS_READY:
+        st.caption("Post-service timer is running in the backend until PICKED UP is pressed.")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_board(selected_date, df):
-    bathers, groomers = get_employee_config()
-    employees = bathers + groomers
-
+    employees = get_staff_list()
     active_df = df[df["status"].fillna(STATUS_NEW) != STATUS_PICKED_UP].copy()
+
     if active_df.empty:
         st.info("No active appointments for this day.")
         return
 
-    # Make one column per employee plus Unassigned.
     employee_columns = employees + ["Unassigned"]
     cols = st.columns(len(employee_columns))
 
@@ -540,13 +773,13 @@ def render_board(selected_date, df):
             st.subheader(employee)
             if employee == "Unassigned":
                 emp_df = active_df[
-                    (active_df["employee_from_calendar"].fillna("") == "Unassigned") &
-                    (active_df["assigned_employee_buttons"].fillna("") == "")
+                    active_df["assigned_employee_buttons"].fillna("").astype(str).str.strip().eq("")
                 ]
             else:
                 emp_df = active_df[
-                    active_df["assigned_employee_buttons"].fillna("").str.contains(rf"\b{re.escape(employee)}\b", case=False, regex=True) |
-                    active_df["employee_from_calendar"].fillna("").str.contains(rf"\b{re.escape(employee)}\b", case=False, regex=True)
+                    active_df["assigned_employee_buttons"].fillna("").astype(str).str.contains(
+                        rf"\b{re.escape(employee)}\b", case=False, regex=True
+                    )
                 ]
             emp_df = emp_df.sort_values("calendar_start")
             if emp_df.empty:
@@ -558,23 +791,40 @@ def render_board(selected_date, df):
 # Main app
 # -----------------------------
 st.title("Lovely Grooming Appointment Timer")
-st.caption("Calendar appointments are pulled into a daily Google Sheets log. Buttons record service and pickup timing.")
+st.caption("Use calendar sync when available, or turn it off and add appointments manually.")
 
 selected_date = st.date_input("Date", value=date.today())
-left, right = st.columns([1, 4])
-with left:
-    if st.button("Sync calendar", use_container_width=True):
-        with st.spinner("Syncing calendar appointments..."):
-            sync_events_to_sheet(selected_date)
-        st.rerun()
-with right:
-    auto_sync = st.toggle("Auto-sync on refresh", value=True)
+
+if "calendar_sync_enabled" not in st.session_state:
+    st.session_state["calendar_sync_enabled"] = True
+
+control_cols = st.columns([1.4, 1, 1, 3])
+with control_cols[0]:
+    sync_enabled = st.toggle(
+        "Sync with calendar",
+        value=st.session_state["calendar_sync_enabled"],
+        help="Turn this off when calendar access is not working or you want to enter appointments manually.",
+    )
+    st.session_state["calendar_sync_enabled"] = sync_enabled
+
+manual_refresh_clicked = False
+with control_cols[1]:
+    if st.button("Refresh", use_container_width=True):
+        manual_refresh_clicked = True
+
+with control_cols[2]:
+    if sync_enabled and st.button("Sync now", use_container_width=True):
+        st.session_state["force_sync_now"] = True
 
 try:
-    if auto_sync:
-        df = sync_events_to_sheet(selected_date)
+    if sync_enabled:
+        with st.spinner("Syncing calendar appointments..."):
+            df = sync_events_to_sheet(selected_date)
+        st.success("Calendar sync is ON. Same-day appointments can be pulled in with Refresh or Sync now.")
     else:
         _, df = load_day_log(selected_date)
+        st.warning("Calendar sync is OFF. Use Add Appointment for manual entries.")
+        render_manual_entry_form(selected_date)
 
     prompt_id = st.session_state.get("notes_prompt_appt")
     if prompt_id:
@@ -585,8 +835,14 @@ try:
     render_board(selected_date, df)
 
     with st.expander("Backend daily sheet preview"):
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        preview = df.copy()
+        if not preview.empty:
+            if "service_seconds" in preview.columns:
+                preview["service_duration"] = preview["service_seconds"].apply(fmt_duration)
+            if "post_service_seconds" in preview.columns:
+                preview["post_service_duration"] = preview["post_service_seconds"].apply(fmt_duration)
+        st.dataframe(preview, use_container_width=True, hide_index=True)
 
 except Exception as exc:
-    st.error("The app could not load. Check Google credentials, shared calendar access, and spreadsheet sharing.")
+    st.error("The app could not load. Check Google credentials, spreadsheet sharing, and calendar sharing if sync is ON.")
     st.exception(exc)
