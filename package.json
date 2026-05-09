@@ -1,8 +1,0 @@
-{
-  "scripts": {
-    "build": "echo \"No build step needed\""
-  },
-  "dependencies": {
-    "googleapis": "^144.0.0"
-  }
-}
